@@ -1,39 +1,81 @@
 """Network inventory and explicitly requested, bounded connectivity probes."""
+import ipaddress
+import subprocess
 import socket
 from pathlib import Path
 
-
 def collect_interfaces():
-    """Return interface names and best-effort IPv4/IPv6 addresses from procfs."""
+    """Return interface names and best-effort IPv4/IPv6 addresses."""
     interfaces = {}
-    for proc_path, family in (
-        ("/proc/net/fib_trie", "ipv4"),
-        ("/proc/net/if_inet6", "ipv6"),
-    ):
-        try:
-            raw = Path(proc_path).read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        if family == "ipv6":
-            for line in raw.splitlines():
-                parts = line.split()
-                if len(parts) >= 6:
-                    address, _idx, _prefix, _scope, _flags, name = parts[:6]
-                    try:
-                        ip = socket.inet_ntop(socket.AF_INET6, bytes.fromhex(address))
-                    except (ValueError, OSError):
-                        continue
-                    interfaces.setdefault(name, {"ipv4": [], "ipv6": []})["ipv6"].append(ip)
-        # fib_trie does not reliably associate addresses with interfaces on all kernels.
-        # IPv4 collection is therefore intentionally left best-effort/empty rather than guessed.
+
     try:
         names = [name for _, name in socket.if_nameindex()]
         for name in names:
-            interfaces.setdefault(name, {"ipv4": [], "ipv6": []})
+            interfaces[name] = {"ipv4": [], "ipv6": []}
     except OSError:
         pass
-    return [{"name": name, **addresses} for name, addresses in sorted(interfaces.items())]
 
+    # Use iproute2 when available to associate IPv4 addresses with interfaces.
+    try:
+        result = subprocess.run(
+            ["ip", "-o", "-4", "addr", "show"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                parts = line.split()
+                if len(parts) < 4:
+                    continue
+
+                name = parts[1]
+                address = parts[3].split("/", 1)[0]
+
+                try:
+                    ip = ipaddress.IPv4Address(address)
+                except ipaddress.AddressValueError:
+                    continue
+
+                entry = interfaces.setdefault(
+                    name, {"ipv4": [], "ipv6": []}
+                )
+                if str(ip) not in entry["ipv4"]:
+                    entry["ipv4"].append(str(ip))
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+    # Read IPv6 addresses from procfs.
+    try:
+        raw = Path("/proc/net/if_inet6").read_text(
+            encoding="utf-8", errors="replace"
+        )
+        for line in raw.splitlines():
+            parts = line.split()
+            if len(parts) < 6:
+                continue
+
+            address, _idx, _prefix, _scope, _flags, name = parts[:6]
+            try:
+                ip = socket.inet_ntop(
+                    socket.AF_INET6, bytes.fromhex(address)
+                )
+            except (ValueError, OSError):
+                continue
+
+            entry = interfaces.setdefault(
+                name, {"ipv4": [], "ipv6": []}
+            )
+            if ip not in entry["ipv6"]:
+                entry["ipv6"].append(ip)
+    except OSError:
+        pass
+
+    return [
+        {"name": name, **addresses}
+        for name, addresses in sorted(interfaces.items())
+    ]
 
 def dns_lookup(host, timeout=3.0):
     """Resolve a host name; getaddrinfo has no portable per-call timeout."""

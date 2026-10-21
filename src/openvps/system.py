@@ -32,37 +32,60 @@ def _uptime_seconds():
     except (ValueError, IndexError):
         return None
 
-
 def _cpu_model():
     raw = _read_text("/proc/cpuinfo", "") or ""
+    preferred_keys = ("model name", "hardware", "processor")
+
+    entries = {}
     for line in raw.splitlines():
-        if line.lower().startswith(("model name", "hardware", "processor")) and ":" in line:
-            value = line.split(":", 1)[1].strip()
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key = key.strip().lower()
+        value = value.strip()
+        if value:
+            entries.setdefault(key, []).append(value)
+
+    for key in preferred_keys:
+        for value in entries.get(key, []):
+            if key == "processor" and value.isdigit():
+                continue
             if value:
                 return value
+
     return platform.processor() or None
 
-
 def _virtualization():
-    # systemd-detect-virt is intentionally not executed; inspect common indicators.
+    # Detect WSL before checking generic container or VM indicators.
+    kernel = (platform.release() or "").lower()
+    version = (_read_text("/proc/version", "") or "").lower()
+
+    if "microsoft" in kernel or "microsoft" in version:
+        return "wsl"
+
     if Path("/.dockerenv").exists():
         return "docker"
+
     cgroup = (_read_text("/proc/1/cgroup", "") or "").lower()
     if "kubepods" in cgroup:
         return "kubernetes/container"
     if "lxc" in cgroup:
         return "lxc"
-    dmi = _read_text("/sys/class/dmi/id/product_name", "") or ""
-    low = dmi.lower()
+
+    dmi = (_read_text("/sys/class/dmi/id/product_name", "") or "").lower()
     for needle, label in (
-        ("kvm", "kvm"), ("vmware", "vmware"), ("virtualbox", "virtualbox"),
-        ("hyper-v", "hyper-v"), ("xen", "xen"), ("qemu", "qemu"),
+        ("kvm", "kvm"),
+        ("vmware", "vmware"),
+        ("virtualbox", "virtualbox"),
+        ("hyper-v", "hyper-v"),
+        ("xen", "xen"),
+        ("qemu", "qemu"),
         ("openvz", "openvz"),
     ):
-        if needle in low:
+        if needle in dmi:
             return label
-    return "unknown"
 
+    return "unknown"
 
 def collect_system():
     os_release = _parse_os_release()
